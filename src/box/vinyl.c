@@ -7455,6 +7455,7 @@ vy_page_read(const struct vy_page_info *page_info, int fd,
 		region_truncate(&fiber()->gc, region_svp);
 		return NULL;
 	}
+	ERROR_INJECT(ERRINJ_VY_READ_PAGE_TIMEOUT, {usleep(50000);});
 
 	/* parse xlog tx and create cursor */
 	const char *data_pos = data;
@@ -7485,6 +7486,9 @@ vy_page_read(const struct vy_page_info *page_info, int fd,
 		return NULL;
 	}
 
+	ERROR_INJECT(ERRINJ_VY_READ_PAGE, {
+		diag_set(ClientError, ER_VINYL, "page read injection");
+		return NULL;});
 	if (row_count != page_info->count) {
 		/* TODO: replace with XlogError, report filename */
 		diag_set(ClientError, ER_VINYL, "invalid row count "
@@ -7614,6 +7618,9 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 		rc = coio_task_post(&task->base, TIMEOUT_INFINITY);
 		if (rc < 0)
 			return -1; /* timed out or cancelled */
+
+		if (task->page == NULL)
+			diag_move(&task->base.diag, diag_get());
 
 		/* task was posted to worker and finished */
 		page = task->page;
