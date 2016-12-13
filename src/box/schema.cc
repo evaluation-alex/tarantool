@@ -330,9 +330,9 @@ schema_init()
 			      2); /* part count */
 	if (key_def == NULL)
 		diag_raise();
-	/* server id */
+	/* server uuid */
 	key_def_set_part(key_def, 0 /* part no */, 0 /* field no */,
-			 FIELD_TYPE_UNSIGNED);
+			 FIELD_TYPE_STRING);
 	/* run id */
 	key_def_set_part(key_def, 1 /* part no */, 1 /* field no */,
 			 FIELD_TYPE_UNSIGNED);

@@ -46,7 +46,7 @@
 #include "relay.h"
 #include "space.h"
 #include "schema.h"
-#include "recovery.h" /* recovery->server_id */
+#include "cluster.h" /* SERVER_UUID */
 #include "iproto_constants.h"
 #include "vinyl.h"
 
@@ -92,22 +92,26 @@ vinyl_purge_meta(struct tuple *tuple)
 	 * Extract vinyl metadata from the tuple.
 	 * Silently ignore alien records.
 	 */
-	uint32_t server_id;
+	if (mp_decode_array(&data) < 6)
+		return;
+	uint32_t len;
+	const char *str = mp_decode_str(&data, &len);
+	struct tt_uuid uuid;
+	if (tt_uuid_from_strl(str, len, &uuid) != 0)
+		return;
 	uint64_t run_id;
 	uint32_t space_id;
 	uint32_t index_id;
 	uint64_t index_lsn;
 	uint32_t state;
-	if (mp_decode_array(&data) < 6 ||
-	    !mp_decode_u32_check(&data, &server_id) ||
-	    !mp_decode_uint_check(&data, &run_id) ||
+	if (!mp_decode_uint_check(&data, &run_id) ||
 	    !mp_decode_u32_check(&data, &space_id) ||
 	    !mp_decode_u32_check(&data, &index_id) ||
 	    !mp_decode_uint_check(&data, &index_lsn) ||
 	    !mp_decode_u32_check(&data, &state))
 		return;
 	/* Filter records that belong to other servers. */
-	if (server_id != recovery->server_id)
+	if (!tt_uuid_is_equal(&uuid, &SERVER_UUID))
 		return;
 	/*
 	 * Lookup the index this record belongs to.
@@ -147,8 +151,10 @@ vinyl_recovery_trigger_f(struct trigger *trigger, void *event)
 	if (tuple == NULL)
 		return;
 
-	uint32_t server_id = tuple_field_u32(tuple, 0);
-	if (server_id != recovery->server_id)
+	struct tt_uuid uuid;
+	if (tt_uuid_from_string(tuple_field_cstr(tuple, 0), &uuid) != 0)
+		return;
+	if (!tt_uuid_is_equal(&uuid, &SERVER_UUID))
 		return;
 
 	uint64_t run_id = tuple_field_uint(tuple, 1);

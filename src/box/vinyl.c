@@ -64,7 +64,6 @@
 #include "tuple_update.h"
 #include "txn.h" /* box_txn_alloc() */
 #include "box.h"
-#include "recovery.h" /* recovery->server_id */
 #include "iproto_constants.h"
 #include "cluster.h" /* SERVER_UUID */
 #include "vclock.h"
@@ -3509,19 +3508,12 @@ vy_index_create(struct vy_index *index)
 	rlist_add_entry(&range->mems, mem, link);
 	range->mem_count++;
 
-	/*
-	 * We can get here while bootstrapping from a remote server.
-	 * In this case we don't insert the run record into the vinyl
-	 * meta table, because we haven't received our server id yet.
-	 * We do it later, in vy_index_end_recovery().
-	 */
-	if (index->env->status == VINYL_ONLINE) {
-		vy_index_acct_range(index, range);
-		vy_scheduler_add_range(index->env->scheduler, range);
-		if (vy_meta_insert_run(range->begin, range->end, index->key_def,
-				       VY_RUN_COMMITTED, &mem->id) != 0)
-			return -1;
-	}
+	vy_index_acct_range(index, range);
+	vy_scheduler_add_range(index->env->scheduler, range);
+	if (vy_meta_insert_run(range->begin, range->end, index->key_def,
+			       VY_RUN_COMMITTED, &mem->id) != 0)
+		return -1;
+
 	return 0;
 }
 
@@ -6381,13 +6373,6 @@ vy_index_end_recovery(struct vy_index *index)
 		if (prev != NULL &&
 		    vy_range_compare_end_with_begin(prev, range->begin) != 0)
 			goto run_missing;
-		/*
-		 * When bootstrapping from a remote server, we don't
-		 * insert run records into the vinyl meta table right
-		 * upon index creation, because our server id is unknown
-		 * at the time (see vy_index_create()). We fix this up
-		 * when completing recovery.
-		 */
 		if (index->env->is_remote_recovery) {
 			struct vy_mem *mem;
 			/*
@@ -6396,12 +6381,6 @@ vy_index_end_recovery(struct vy_index *index)
 			 */
 			assert(range->mem_count == 1);
 			assert(range->run_count == 0);
-			mem = rlist_first_entry(&range->mems,
-						struct vy_mem, link);
-			if (vy_meta_insert_run(range->begin, range->end,
-					       index->key_def, VY_RUN_COMMITTED,
-					       &mem->id) != 0)
-				return -1;
 			/*
 			 * After we're done bootstrapping from a remote
 			 * server, but before the WAL thread is started,
@@ -9901,11 +9880,12 @@ vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
 		   int64_t *p_run_id)
 {
 	int64_t run_id = 0;
-	uint32_t server_id = recovery->server_id;
+	char server_uuid_str[UUID_STR_LEN];
+	tt_uuid_to_string(&SERVER_UUID, server_uuid_str);
 
 	uint32_t key_size = 0;
 	key_size += mp_sizeof_array(1);
-	key_size += mp_sizeof_uint(server_id);
+	key_size += mp_sizeof_str(UUID_STR_LEN);
 
 	char *key = box_txn_alloc(key_size);
 	if (key == NULL) {
@@ -9915,7 +9895,7 @@ vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
 
 	char *key_end = key;
 	key_end = mp_encode_array(key_end, 1);
-	key_end = mp_encode_uint(key_end, server_id);
+	key_end = mp_encode_str(key_end, server_uuid_str, UUID_STR_LEN);
 	assert(key + key_size == key_end);
 
 	box_tuple_t *max;
@@ -9924,7 +9904,11 @@ vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
 	if (max != NULL) {
 		const char *data = tuple_data(max);
 		(void)mp_decode_array(&data);
-		if (mp_decode_uint(&data) == server_id)
+		uint32_t len;
+		const char *str = mp_decode_str(&data, &len);
+		struct tt_uuid uuid;
+		if (tt_uuid_from_strl(str, len, &uuid) == 0 &&
+		    tt_uuid_is_equal(&uuid, &SERVER_UUID))
 			run_id = mp_decode_uint(&data) + 1;
 	}
 
@@ -9932,8 +9916,8 @@ vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
 	assert(mp_sizeof_array(0) <= sizeof(empty_key));
 	mp_encode_array(empty_key, 0);
 
-	if (boxk(IPROTO_INSERT, BOX_VINYL_ID, "[%u%llu%u%u%llu%u%M%M]",
-		 (unsigned)server_id, (unsigned long long)run_id,
+	if (boxk(IPROTO_INSERT, BOX_VINYL_ID, "[%s%llu%u%u%llu%u%M%M]",
+		 server_uuid_str, (unsigned long long)run_id,
 		 (unsigned)key_def->space_id, (unsigned)key_def->iid,
 		 (unsigned long long)key_def->opts.lsn, (unsigned)state,
 		 begin != NULL ? vy_key_data(begin) : empty_key,
@@ -9951,9 +9935,10 @@ static int
 vy_meta_update_run(int64_t run_id, enum vy_run_state state)
 {
 	assert(run_id >= 0);
-	uint32_t server_id = recovery->server_id;
-	return boxk(IPROTO_UPDATE, BOX_VINYL_ID, "[%u%llu][[%s%d%u]]",
-		    (unsigned)server_id, (unsigned long long)run_id,
+	char server_uuid_str[UUID_STR_LEN];
+	tt_uuid_to_string(&SERVER_UUID, server_uuid_str);
+	return boxk(IPROTO_UPDATE, BOX_VINYL_ID, "[%s%llu][[%s%d%u]]",
+		    server_uuid_str, (unsigned long long)run_id,
 		    "=", 5, (unsigned)state);
 }
 
@@ -9964,9 +9949,10 @@ static int
 vy_meta_delete_run(int64_t run_id)
 {
 	assert(run_id >= 0);
-	uint32_t server_id = recovery->server_id;
-	return boxk(IPROTO_DELETE, BOX_VINYL_ID, "[%u%llu]",
-		    (unsigned)server_id, (unsigned long long)run_id);
+	char server_uuid_str[UUID_STR_LEN];
+	tt_uuid_to_string(&SERVER_UUID, server_uuid_str);
+	return boxk(IPROTO_DELETE, BOX_VINYL_ID, "[%s%llu]",
+		    server_uuid_str, (unsigned long long)run_id);
 }
 
 /*

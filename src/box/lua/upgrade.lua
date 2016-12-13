@@ -530,7 +530,7 @@ local function upgrade_vinyl_to_1_7_2()
 
     log.info("create space _vinyl")
     local format = {}
-    format[1] = {name = 'server_id', type = 'num'}
+    format[1] = {name = 'server_uuid', type = 'str'}
     format[2] = {name = 'run_id', type = 'num'}
     format[3] = {name = 'space_id', type = 'num'}
     format[4] = {name = 'index_id', type = 'num'}
@@ -542,7 +542,7 @@ local function upgrade_vinyl_to_1_7_2()
     -- primary key: server id, run id
     log.info("create index primary on _vinyl")
     _index:insert{_vinyl.id, 0, 'primary', 'tree', {unique = true},
-                  {{0, 'unsigned'}, {1, 'unsigned'}}}
+                  {{0, 'string'}, {1, 'unsigned'}}}
 end
 
 local function upgrade_to_1_7_2()
