@@ -9924,60 +9924,20 @@ vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
 	if (max != NULL) {
 		const char *data = tuple_data(max);
 		(void)mp_decode_array(&data);
-		if (mp_decode_uint(&data) == recovery->server_id)
+		if (mp_decode_uint(&data) == server_id)
 			run_id = mp_decode_uint(&data) + 1;
 	}
 
-	uint32_t tuple_size = 0;
-	tuple_size += mp_sizeof_array(8);
-	tuple_size += mp_sizeof_uint(server_id);
-	tuple_size += mp_sizeof_uint(run_id);
-	tuple_size += mp_sizeof_uint(key_def->space_id);
-	tuple_size += mp_sizeof_uint(key_def->iid);
-	tuple_size += mp_sizeof_uint(key_def->opts.lsn);
-	tuple_size += mp_sizeof_uint(state);
-	const char *begin_data;
-	uint32_t begin_size;
-	if (begin != NULL) {
-		begin_data = vy_key_data_range(begin, &begin_size);
-		tuple_size += begin_size;
-	} else
-		tuple_size += mp_sizeof_array(0);
-	const char *end_data;
-	uint32_t end_size;
-	if (end != NULL) {
-		end_data = vy_key_data_range(end, &end_size);
-		tuple_size += end_size;
-	} else
-		tuple_size += mp_sizeof_array(0);
+	char empty_key[16];
+	assert(mp_sizeof_array(0) <= sizeof(empty_key));
+	mp_encode_array(empty_key, 0);
 
-	char *tuple = box_txn_alloc(tuple_size);
-	if (tuple == NULL) {
-		diag_set(OutOfMemory, tuple_size, "box_txn_alloc", "tuple");
-		return -1;
-	}
-
-	char *tuple_end = tuple;
-	tuple_end = mp_encode_array(tuple_end, 8);
-	tuple_end = mp_encode_uint(tuple_end, server_id);
-	tuple_end = mp_encode_uint(tuple_end, run_id);
-	tuple_end = mp_encode_uint(tuple_end, key_def->space_id);
-	tuple_end = mp_encode_uint(tuple_end, key_def->iid);
-	tuple_end = mp_encode_uint(tuple_end, key_def->opts.lsn);
-	tuple_end = mp_encode_uint(tuple_end, state);
-	if (begin != NULL) {
-		memcpy(tuple_end, begin_data, begin_size);
-		tuple_end += begin_size;
-	} else
-		tuple_end = mp_encode_array(tuple_end, 0);
-	if (end != NULL) {
-		memcpy(tuple_end, end_data, end_size);
-		tuple_end += end_size;
-	} else
-		tuple_end = mp_encode_array(tuple_end, 0);
-	assert(tuple + tuple_size == tuple_end);
-
-	if (box_insert(BOX_VINYL_ID, tuple, tuple_end, NULL) != 0)
+	if (boxk(IPROTO_INSERT, BOX_VINYL_ID, "[%u%llu%u%u%llu%u%M%M]",
+		 (unsigned)server_id, (unsigned long long)run_id,
+		 (unsigned)key_def->space_id, (unsigned)key_def->iid,
+		 (unsigned long long)key_def->opts.lsn, (unsigned)state,
+		 begin != NULL ? vy_key_data(begin) : empty_key,
+		 end != NULL ? vy_key_data(end) : empty_key) != 0)
 		return -1;
 
 	*p_run_id = run_id;
@@ -9992,46 +9952,9 @@ vy_meta_update_run(int64_t run_id, enum vy_run_state state)
 {
 	assert(run_id >= 0);
 	uint32_t server_id = recovery->server_id;
-
-	uint32_t key_size = 0;
-	key_size += mp_sizeof_array(2);
-	key_size += mp_sizeof_uint(server_id);
-	key_size += mp_sizeof_uint(run_id);
-
-	char *key = box_txn_alloc(key_size);
-	if (key == NULL) {
-		diag_set(OutOfMemory, key_size, "box_txn_alloc", "key");
-		return -1;
-	}
-
-	char *key_end = key;
-	key_end = mp_encode_array(key_end, 2);
-	key_end = mp_encode_uint(key_end, server_id);
-	key_end = mp_encode_uint(key_end, run_id);
-	assert(key + key_size == key_end);
-
-	uint32_t ops_size = 0;
-	ops_size += mp_sizeof_array(1);
-	ops_size += mp_sizeof_array(3);
-	ops_size += mp_sizeof_str(1);
-	ops_size += mp_sizeof_uint(5);
-	ops_size += mp_sizeof_uint(state);
-
-	char *ops = box_txn_alloc(ops_size);
-	if (ops == NULL) {
-		diag_set(OutOfMemory, key_size, "box_txn_alloc", "ops");
-		return -1;
-	}
-
-	char *ops_end = ops;
-	ops_end = mp_encode_array(ops_end, 1);
-	ops_end = mp_encode_array(ops_end, 3);
-	ops_end = mp_encode_str(ops_end, "=", 1);
-	ops_end = mp_encode_uint(ops_end, 5);
-	ops_end = mp_encode_uint(ops_end, state);
-	assert(ops + ops_size == ops_end);
-
-	return box_update(BOX_VINYL_ID, 0, key, key_end, ops, ops_end, 0, NULL);
+	return boxk(IPROTO_UPDATE, BOX_VINYL_ID, "[%u%llu][[%s%d%u]]",
+		    (unsigned)server_id, (unsigned long long)run_id,
+		    "=", 5, (unsigned)state);
 }
 
 /*
@@ -10042,25 +9965,8 @@ vy_meta_delete_run(int64_t run_id)
 {
 	assert(run_id >= 0);
 	uint32_t server_id = recovery->server_id;
-
-	uint32_t key_size = 0;
-	key_size += mp_sizeof_array(2);
-	key_size += mp_sizeof_uint(server_id);
-	key_size += mp_sizeof_uint(run_id);
-
-	char *key = box_txn_alloc(key_size);
-	if (key == NULL) {
-		diag_set(OutOfMemory, key_size, "box_txn_alloc", "key");
-		return -1;
-	}
-
-	char *key_end = key;
-	key_end = mp_encode_array(key_end, 2);
-	key_end = mp_encode_uint(key_end, server_id);
-	key_end = mp_encode_uint(key_end, run_id);
-	assert(key + key_size == key_end);
-
-	return box_delete(BOX_VINYL_ID, 0, key, key_end, NULL);
+	return boxk(IPROTO_DELETE, BOX_VINYL_ID, "[%u%llu]",
+		    (unsigned)server_id, (unsigned long long)run_id);
 }
 
 /*
