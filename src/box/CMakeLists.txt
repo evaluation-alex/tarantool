@@ -47,6 +47,7 @@ add_library(box STATIC
     vinyl_engine.cc
     vinyl_space.cc
     vinyl_index.cc
+    vinyl_meta.c
     vinyl.c
     space.cc
     func.cc

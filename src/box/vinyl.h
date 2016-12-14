@@ -211,6 +211,10 @@ int
 vy_index_send(struct vy_index *index, vy_send_row_f sendrow, void *ctx);
 
 /*
+ * Metadata
+ */
+
+/*
  * State of a run as recorded in the vinyl metadata table.
  */
 enum vy_run_state {
@@ -242,6 +246,15 @@ enum vy_run_state {
 	 */
 	VY_RUN_FAILED,
 };
+
+int
+vy_meta_insert_run(const char *begin, const char *end,
+		   const struct key_def *key_def,
+		   enum vy_run_state state, int64_t *p_run_id);
+int
+vy_meta_update_run(int64_t run_id, enum vy_run_state state);
+int
+vy_meta_delete_run(int64_t run_id);
 
 int
 vy_recovery_insert_run(struct vy_index *index, int64_t id,
