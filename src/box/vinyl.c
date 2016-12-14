@@ -9981,83 +9981,13 @@ vy_meta_abort_compact(struct vy_range *range)
 }
 
 /*
- * Given a tuple from the vinyl metadata table (run beginning or end),
- * check its format and create a vinyl key for it.
- */
-static int
-vy_meta_decode_key(struct key_def *key_def, struct tuple_format *format,
-		   const char *tuple, struct vy_stmt **result)
-{
-	const char *data = tuple;
-	if (mp_decode_array(&data) == 0) {
-		*result = NULL;
-		return 0;
-	}
-	if (tuple_validate_raw(format, tuple) != 0)
-		return -1;
-	struct vy_stmt *stmt = vy_stmt_extract_key_raw(tuple, IPROTO_SELECT,
-						       key_def);
-	if (stmt == NULL)
-		return -1;
-	*result = stmt;
-	return 0;
-}
-
-/*
- * Check a run record received from the vinyl metadata table and create
- * vinyl keys for run boundaries.
- */
-static int
-vy_meta_decode_record(struct key_def *key_def, struct tuple_format *format,
-		      const char *begin_raw, const char *end_raw,
-		      struct vy_stmt **p_begin, struct vy_stmt **p_end)
-{
-	struct vy_stmt *begin = NULL, *end = NULL;
-	if (vy_meta_decode_key(key_def, format, begin_raw, &begin) != 0 ||
-	    vy_meta_decode_key(key_def, format, end_raw, &end) != 0)
-		goto fail;
-	if (begin != NULL && end != NULL &&
-	    vy_key_compare(begin, end, key_def) >= 0)
-		goto invalid_meta;
-	*p_begin = begin;
-	*p_end = end;
-	return 0;
-invalid_meta:
-	diag_set(ClientError, ER_VINYL, "invalid metadata");
-fail:
-	if (begin != NULL)
-		vy_stmt_unref(begin);
-	if (end != NULL)
-		vy_stmt_unref(end);
-	return -1;
-}
-
-static void
-vy_recovery_debug(struct key_def *key_def, int64_t run_id,
-		  const char *begin, const char *end, const char *msg)
-{
-	say_debug("%s: %"PRIu32"/%"PRIu32"/%"PRIi64": id %"PRIi64" %s .. %s",
-		  msg, key_def->space_id, key_def->iid, key_def->opts.lsn,
-		  run_id, vy_key_str(begin), vy_key_str(end));
-}
-
-/*
  * Replay a vinyl metadata record inserting a new run into an index.
  */
-int
+static int
 vy_recovery_insert_run(struct vy_index *index, int64_t id,
-		       const char *begin_raw, const char *end_raw)
+		       struct vy_stmt *begin, struct vy_stmt *end)
 {
 	struct vy_range *range, *part;
-	int rc = -1;
-
-	vy_recovery_debug(index->key_def, id, begin_raw, end_raw, "insert run");
-
-	struct vy_stmt *begin = NULL, *end = NULL;
-	if (vy_meta_decode_record(index->key_def, index->format,
-				  begin_raw, end_raw, &begin, &end) != 0)
-		return -1;
-
 retry:
 	/* Find the range to insert this run into. */
 	range = (begin != NULL) ?
@@ -10177,53 +10107,36 @@ retry:
 prepare_split:
 	part = vy_range_new(index, begin, end);
 	if (part == NULL)
-		goto out;
+		return -1;
 	vy_range_add_compact_part(range, part);
 	range = part;
 	goto new_run;
 new_range:
 	range = vy_range_new(index, begin, end);
 	if (range == NULL)
-		goto out;
+		return -1;
 	vy_index_add_range(index, range);
 new_run:
-	if (vy_range_recover_run(range, id) != 0)
-		goto out;
-	rc = 0; /* success */
-out:
-	if (begin != NULL)
-		vy_stmt_unref(begin);
-	if (end != NULL)
-		vy_stmt_unref(end);
-	return rc;
+	return vy_range_recover_run(range, id);
 fail:
 	diag_set(ClientError, ER_VINYL,
 		 "run file missing or metadata corrupted");
-	goto out;
+	return -1;
 }
 
 /*
  * Replay a vinyl metadata record deleting a run from an index.
  */
-int
+static int
 vy_recovery_delete_run(struct vy_index *index, int64_t id,
-		       const char *begin_raw, const char *end_raw)
+		       struct vy_stmt *begin, struct vy_stmt *end)
 {
-	struct vy_range *range;
-	int rc = -1;
-
 	/* Ignore deleted runs when recovering from a snapshot. */
 	if (index->env->status == VINYL_INITIAL_RECOVERY)
 		return 0;
 
-	vy_recovery_debug(index->key_def, id, begin_raw, end_raw, "delete run");
-
-	struct vy_stmt *begin = NULL, *end = NULL;
-	if (vy_meta_decode_record(index->key_def, index->format,
-				  begin_raw, end_raw, &begin, &end) != 0)
-		return -1;
-
 	/* Find the range to delete this run from. */
+	struct vy_range *range;
 	range = (begin != NULL) ?
 		vy_range_tree_psearch(&index->tree, begin) :
 		vy_range_tree_first(&index->tree);
@@ -10261,16 +10174,78 @@ vy_recovery_delete_run(struct vy_index *index, int64_t id,
 	if (range->run_count == 0 && !rlist_empty(&range->compact_list))
 		vy_range_commit_compact_parts(range);
 
-	rc = 0;
+	return 0;
+fail:
+	diag_set(ClientError, ER_VINYL,
+		 "run file missing or metadata corrupted");
+	return -1;
+}
+
+/*
+ * Replay a vinyl metadata record.
+ */
+int
+vy_recovery_process_meta(struct vy_index *index, const struct vy_meta *def)
+{
+	struct key_def *key_def = index->key_def;
+	struct vy_stmt *begin = NULL, *end = NULL;
+	const char *data;
+	int rc = -1;
+
+	say_debug("process meta: %"PRIu32"/%"PRIu32"/%"PRIu64": "
+		  "id %"PRIu64" state %d %s .. %s",
+		  def->space_id, def->index_id, def->index_lsn, def->run_id,
+		  def->state, vy_key_str(def->begin), vy_key_str(def->end));
+
+	/* Extract range begin. */
+	data = def->begin;
+	if (mp_decode_array(&data) > 0) {
+		if (tuple_validate_raw(index->format, def->begin) != 0)
+			goto invalid_meta;
+		begin = vy_stmt_extract_key_raw(def->begin, IPROTO_SELECT,
+						key_def);
+		if (begin == NULL)
+			goto out; /* oom */
+	}
+	/* Extract range end. */
+	data = def->end;
+	if (mp_decode_array(&data) > 0) {
+		if (tuple_validate_raw(index->format, def->end) != 0)
+			goto invalid_meta;
+		end = vy_stmt_extract_key_raw(def->end, IPROTO_SELECT,
+						key_def);
+		if (end == NULL)
+			goto out; /* oom */
+	}
+	/* Sanity check: begin < end. */
+	if (begin != NULL && end != NULL &&
+	    vy_key_compare(begin, end, key_def) >= 0)
+		goto invalid_meta;
+
+	/* Process the record. */
+	switch (def->state) {
+	case VY_RUN_COMMITTED:
+		rc = vy_recovery_insert_run(index, def->run_id, begin, end);
+		break;
+	case VY_RUN_DELETED:
+		rc = vy_recovery_delete_run(index, def->run_id, begin, end);
+		break;
+	case VY_RUN_RESERVED:
+	case VY_RUN_FAILED:
+		rc = 0;
+		break;
+	default:
+		unreachable();
+	}
 out:
 	if (begin != NULL)
 		vy_stmt_unref(begin);
 	if (end != NULL)
 		vy_stmt_unref(end);
 	return rc;
-fail:
-	diag_set(ClientError, ER_VINYL,
-		 "run file missing or metadata corrupted");
+
+invalid_meta:
+	diag_set(ClientError, ER_VINYL, "invalid metadata");
 	goto out;
 }
 

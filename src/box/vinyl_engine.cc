@@ -116,23 +116,8 @@ vinyl_recovery_trigger_f(struct trigger *trigger, void *event)
 	VinylIndex *index = vinyl_index_from_meta(&def);
 	if (index == NULL)
 		return;
-	switch (def.state) {
-	case VY_RUN_COMMITTED:
-		if (vy_recovery_insert_run(index->db, def.run_id,
-					   def.begin, def.end) != 0)
-			diag_raise();
-		break;
-	case VY_RUN_DELETED:
-		if (vy_recovery_delete_run(index->db, def.run_id,
-					   def.begin, def.end) != 0)
-			diag_raise();
-		break;
-	case VY_RUN_RESERVED:
-	case VY_RUN_FAILED:
-		break;
-	default:
-		unreachable();
-	}
+	if (vy_recovery_process_meta(index->db, &def) != 0)
+		diag_raise();
 }
 
 static struct trigger vinyl_recovery_trigger = {

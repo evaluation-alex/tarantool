@@ -281,11 +281,8 @@ int
 vy_meta_delete_run(int64_t run_id);
 
 int
-vy_recovery_insert_run(struct vy_index *index, int64_t id,
-		       const char *begin, const char *end);
-int
-vy_recovery_delete_run(struct vy_index *index, int64_t id,
-		       const char *begin, const char *end);
+vy_recovery_process_meta(struct vy_index *index, const struct vy_meta *def);
+
 void
 vy_index_purge_run(struct vy_index *index, int64_t run_id);
 
