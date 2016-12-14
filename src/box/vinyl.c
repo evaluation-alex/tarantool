@@ -2067,9 +2067,9 @@ static void
 vy_scheduler_mem_dumped(struct vy_scheduler *scheduler, struct vy_mem *mem);
 
 static int
-vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
-		   struct key_def *key_def, enum vy_run_state state,
-		   int64_t *p_run_id);
+vy_meta_insert_run(const char *begin, const char *end,
+		   const struct key_def *key_def,
+		   enum vy_run_state state, int64_t *p_run_id);
 static int
 vy_meta_prepare_compact(int n_parts, struct vy_range **parts);
 static int
@@ -2187,6 +2187,26 @@ vy_range_compare_end_with_begin(struct vy_range *range, struct vy_stmt *begin)
 	if (range->end == NULL || begin == NULL)
 		return 1;
 	return vy_key_compare(range->end, begin, range->index->key_def);
+}
+
+/*
+ * Extract MsgPack data from range->begin.
+ * If range->begin is -inf (i.e. NULL), return NULL.
+ */
+static const char *
+vy_range_begin_data(struct vy_range *range)
+{
+	return range->begin != NULL ? vy_key_data(range->begin) : NULL;
+}
+
+/*
+ * Extract MsgPack data from range->end.
+ * If range->end is +inf (i.e. NULL), return NULL.
+ */
+static const char *
+vy_range_end_data(struct vy_range *range)
+{
+	return range->end != NULL ? vy_key_data(range->end) : NULL;
 }
 
 static void
@@ -3510,7 +3530,8 @@ vy_index_create(struct vy_index *index)
 
 	vy_index_acct_range(index, range);
 	vy_scheduler_add_range(index->env->scheduler, range);
-	if (vy_meta_insert_run(range->begin, range->end, index->key_def,
+	if (vy_meta_insert_run(vy_range_begin_data(range),
+			       vy_range_end_data(range), index->key_def,
 			       VY_RUN_COMMITTED, &mem->id) != 0)
 		return -1;
 
@@ -3942,7 +3963,8 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	if (mem == NULL)
 		goto err_mem;
 
-	if (vy_meta_insert_run(range->begin, range->end, index->key_def,
+	if (vy_meta_insert_run(vy_range_begin_data(range),
+			       vy_range_end_data(range), index->key_def,
 			       VY_RUN_COMMITTED, &mem->id) != 0)
 		goto err_meta;
 
@@ -6402,7 +6424,8 @@ vy_index_end_recovery(struct vy_index *index)
 				return -1;
 			rlist_add_entry(&range->mems, mem, link);
 			range->mem_count++;
-			if (vy_meta_insert_run(range->begin, range->end,
+			if (vy_meta_insert_run(vy_range_begin_data(range),
+					       vy_range_end_data(range),
 					       index->key_def, VY_RUN_COMMITTED,
 					       &mem->id) != 0)
 				return -1;
@@ -9875,9 +9898,9 @@ vy_cursor_delete(struct vy_cursor *c)
  * This function allocates a unique ID for the run on success.
  */
 static int
-vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
-		   struct key_def *key_def, enum vy_run_state state,
-		   int64_t *p_run_id)
+vy_meta_insert_run(const char *begin, const char *end,
+		   const struct key_def *key_def,
+		   enum vy_run_state state, int64_t *p_run_id)
 {
 	int64_t run_id = 0;
 	char server_uuid_str[UUID_STR_LEN];
@@ -9915,13 +9938,16 @@ vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
 	char empty_key[16];
 	assert(mp_sizeof_array(0) <= sizeof(empty_key));
 	mp_encode_array(empty_key, 0);
+	if (begin == NULL)
+		begin = empty_key;
+	if (end == NULL)
+		end = empty_key;
 
 	if (boxk(IPROTO_INSERT, BOX_VINYL_ID, "[%s%llu%u%u%llu%u%M%M]",
 		 server_uuid_str, (unsigned long long)run_id,
 		 (unsigned)key_def->space_id, (unsigned)key_def->iid,
 		 (unsigned long long)key_def->opts.lsn, (unsigned)state,
-		 begin != NULL ? vy_key_data(begin) : empty_key,
-		 end != NULL ? vy_key_data(end) : empty_key) != 0)
+		 begin, end) != 0)
 		return -1;
 
 	*p_run_id = run_id;
@@ -9976,11 +10002,13 @@ vy_meta_prepare_compact(int n_parts, struct vy_range **parts)
 		struct vy_mem *mem = rlist_first_entry(&r->mems,
 						       struct vy_mem, link);
 		assert(r->new_run->id < 0);
-		if (vy_meta_insert_run(r->begin, r->end, r->index->key_def,
+		const char *begin = vy_range_begin_data(r);
+		const char *end = vy_range_end_data(r);
+		if (vy_meta_insert_run(begin, end, r->index->key_def,
 				       VY_RUN_RESERVED, &r->new_run->id) != 0)
 			goto rollback;
 		assert(mem->id < 0);
-		if (vy_meta_insert_run(r->begin, r->end, r->index->key_def,
+		if (vy_meta_insert_run(begin, end, r->index->key_def,
 				       VY_RUN_COMMITTED, &mem->id) != 0)
 			goto rollback;
 	}
