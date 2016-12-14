@@ -10,7 +10,6 @@
 #include "schema.h" /* BOX_VINYL_ID */
 #include "tt_uuid.h"
 #include "tuple.h"
-#include "txn.h" /* box_txn_alloc() */
 
 /*
  * Insert a run record into the vinyl metadata table.
@@ -26,20 +25,11 @@ vy_meta_insert_run(const char *begin, const char *end,
 	char server_uuid_str[UUID_STR_LEN];
 	tt_uuid_to_string(&SERVER_UUID, server_uuid_str);
 
-	uint32_t key_size = 0;
-	key_size += mp_sizeof_array(1);
-	key_size += mp_sizeof_str(UUID_STR_LEN);
-
-	char *key = box_txn_alloc(key_size);
-	if (key == NULL) {
-		diag_set(OutOfMemory, key_size, "box_txn_alloc", "key");
-		return -1;
-	}
-
+	char key[64];
 	char *key_end = key;
 	key_end = mp_encode_array(key_end, 1);
 	key_end = mp_encode_str(key_end, server_uuid_str, UUID_STR_LEN);
-	assert(key + key_size == key_end);
+	assert(key_end <= key + sizeof(key));
 
 	box_tuple_t *max;
 	if (box_index_max(BOX_VINYL_ID, 0, key, key_end, &max) != 0)
