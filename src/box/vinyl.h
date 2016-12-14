@@ -38,6 +38,7 @@
 #include <small/region.h>
 
 #include "index.h"
+#include "tt_uuid.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -245,8 +246,31 @@ enum vy_run_state {
 	 * It is ignored on recovery.
 	 */
 	VY_RUN_FAILED,
+
+	vy_run_state_MAX,
 };
 
+struct vy_meta {
+	/** UUID of the server. */
+	struct tt_uuid server_uuid;
+	/** Unique ID of the run. */
+	uint64_t run_id;
+	/** Space ID this run is for. */
+	uint32_t space_id;
+	/** Index ID this run is for. */
+	uint32_t index_id;
+	/** LSN at the time of index creation. */
+	uint64_t index_lsn;
+	/** Run state. */
+	enum vy_run_state state;
+	/** Start of the range this run belongs to. */
+	const char *begin;
+	/** End of the range this run belongs to. */
+	const char *end;
+};
+
+int
+vy_meta_create_from_tuple(struct vy_meta *r, struct tuple *tuple);
 int
 vy_meta_insert_run(const char *begin, const char *end,
 		   const struct key_def *key_def,

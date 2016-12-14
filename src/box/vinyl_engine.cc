@@ -51,32 +51,21 @@
 #include "vinyl.h"
 
 /*
- * Try to decode u64 from MsgPack data.
- * Return true on success.
+ * Lookup the index corresponding to a record in the metadata table.
  */
-static inline bool
-mp_decode_uint_check(const char **data, uint64_t *pval)
+static VinylIndex *
+vinyl_index_from_meta(const struct vy_meta *def)
 {
-	if (mp_typeof(**data) != MP_UINT)
-		return false;
-	*pval = mp_decode_uint(data);
-	return true;
-}
-
-/*
- * Try to decode u32 from MsgPack data.
- * Return true on success.
- */
-static inline bool
-mp_decode_u32_check(const char **data, uint32_t *pval)
-{
-	uint64_t val;
-	if (!mp_decode_uint_check(data, &val))
-		return false;
-	if (val > UINT32_MAX)
-		return false;
-	*pval = val;
-	return true;
+	if (!tt_uuid_is_equal(&def->server_uuid, &SERVER_UUID))
+		return NULL;
+	struct space *space = space_by_id(def->space_id);
+	if (space == NULL)
+		return NULL;
+	VinylIndex *index = (VinylIndex *)space_index(space, def->index_id);
+	if (index == NULL ||
+	    index->key_def->opts.lsn != (int64_t)def->index_lsn)
+		return NULL;
+	return index;
 }
 
 /*
@@ -86,55 +75,26 @@ mp_decode_u32_check(const char **data, uint32_t *pval)
 static void
 vinyl_purge_meta(struct tuple *tuple)
 {
-	uint32_t size;
-	const char *data = tuple_data_range(tuple, &size);
-	/*
-	 * Extract vinyl metadata from the tuple.
-	 * Silently ignore alien records.
-	 */
-	if (mp_decode_array(&data) < 6)
+	struct vy_meta def;
+	if (vy_meta_create_from_tuple(&def, tuple) != 0) {
+		/* Silently ignore alien records. */
+		diag_clear(diag_get());
 		return;
-	uint32_t len;
-	const char *str = mp_decode_str(&data, &len);
-	struct tt_uuid uuid;
-	if (tt_uuid_from_strl(str, len, &uuid) != 0)
+	}
+	VinylIndex *index = vinyl_index_from_meta(&def);
+	if (index == NULL)
 		return;
-	uint64_t run_id;
-	uint32_t space_id;
-	uint32_t index_id;
-	uint64_t index_lsn;
-	uint32_t state;
-	if (!mp_decode_uint_check(&data, &run_id) ||
-	    !mp_decode_u32_check(&data, &space_id) ||
-	    !mp_decode_u32_check(&data, &index_id) ||
-	    !mp_decode_uint_check(&data, &index_lsn) ||
-	    !mp_decode_u32_check(&data, &state))
-		return;
-	/* Filter records that belong to other servers. */
-	if (!tt_uuid_is_equal(&uuid, &SERVER_UUID))
-		return;
-	/*
-	 * Lookup the index this record belongs to.
-	 *
-	 * TODO: Delete records left from dropped indexes.
-	 */
-	struct space *space = space_by_id(space_id);
-	if (space == NULL)
-		return;
-	VinylIndex *index = (VinylIndex *)space_index(space, index_id);
-	if (index == NULL ||
-	    index->key_def->opts.lsn != (int64_t)index_lsn)
-		return;
-
 	/*
 	 * Delete the record if it is stale, i.e. left from
 	 * a deleted or failed run.
 	 *
-	 * TODO: Delete reserved records.
+	 * TODO:
+	 *  - Delete reserved records.
+	 *  - Delete records left from dropped indexes.
 	 */
-	if (state == VY_RUN_DELETED ||
-	    state == VY_RUN_FAILED)
-		vy_index_purge_run(index->db, run_id);
+	if (def.state == VY_RUN_DELETED ||
+	    def.state == VY_RUN_FAILED)
+		vy_index_purge_run(index->db, def.run_id);
 }
 
 /*
@@ -150,42 +110,28 @@ vinyl_recovery_trigger_f(struct trigger *trigger, void *event)
 	struct tuple *tuple = stmt->new_tuple;
 	if (tuple == NULL)
 		return;
-
-	struct tt_uuid uuid;
-	if (tt_uuid_from_string(tuple_field_cstr(tuple, 0), &uuid) != 0)
+	struct vy_meta def;
+	if (vy_meta_create_from_tuple(&def, tuple) != 0)
+		diag_raise();
+	VinylIndex *index = vinyl_index_from_meta(&def);
+	if (index == NULL)
 		return;
-	if (!tt_uuid_is_equal(&uuid, &SERVER_UUID))
-		return;
-
-	uint64_t run_id = tuple_field_uint(tuple, 1);
-	uint32_t space_id = tuple_field_u32(tuple, 2);
-	uint32_t index_id = tuple_field_u32(tuple, 3);
-	uint64_t index_lsn = tuple_field_uint(tuple, 4);
-	enum vy_run_state state = (enum vy_run_state)tuple_field_u32(tuple, 5);
-	const char *begin = tuple_field_check(tuple, 6, MP_ARRAY);
-	const char *end = tuple_field_check(tuple, 7, MP_ARRAY);
-
-	struct space *space = space_by_id(space_id);
-	if (space == NULL)
-		return;
-	VinylIndex *index = (VinylIndex *)space_index(space, index_id);
-	if (index == NULL || index->key_def->opts.lsn != (int64_t)index_lsn)
-		return;
-
-	switch (state) {
+	switch (def.state) {
 	case VY_RUN_COMMITTED:
-		if (vy_recovery_insert_run(index->db, run_id, begin, end) != 0)
+		if (vy_recovery_insert_run(index->db, def.run_id,
+					   def.begin, def.end) != 0)
 			diag_raise();
 		break;
 	case VY_RUN_DELETED:
-		if (vy_recovery_delete_run(index->db, run_id, begin, end) != 0)
+		if (vy_recovery_delete_run(index->db, def.run_id,
+					   def.begin, def.end) != 0)
 			diag_raise();
 		break;
 	case VY_RUN_RESERVED:
 	case VY_RUN_FAILED:
 		break;
 	default:
-		tnt_raise(ClientError, ER_VINYL, "invalid metadata");
+		unreachable();
 	}
 }
 

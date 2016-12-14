@@ -12,6 +12,72 @@
 #include "tuple.h"
 
 /*
+ * Try to decode u64 from MsgPack data.
+ * Return true on success.
+ */
+static inline bool
+mp_decode_uint_check(const char **data, uint64_t *pval)
+{
+	if (mp_typeof(**data) != MP_UINT)
+		return false;
+	*pval = mp_decode_uint(data);
+	return true;
+}
+
+/*
+ * Try to decode u32 from MsgPack data.
+ * Return true on success.
+ */
+static inline bool
+mp_decode_u32_check(const char **data, uint32_t *pval)
+{
+	uint64_t val;
+	if (!mp_decode_uint_check(data, &val))
+		return false;
+	if (val > UINT32_MAX)
+		return false;
+	*pval = val;
+	return true;
+}
+
+/*
+ * Fill vy_meta structure from a record in _vinyl
+ * system space.
+ */
+int
+vy_meta_create_from_tuple(struct vy_meta *def, struct tuple *tuple)
+{
+	const char *data = tuple_data(tuple);
+	uint32_t len;
+	const char *str;
+
+	if (mp_decode_array(&data) != 8)
+		goto fail;
+	if (mp_typeof(*data) != MP_STR)
+		goto fail;
+	str = mp_decode_str(&data, &len);
+	if (tt_uuid_from_strl(str, len, &def->server_uuid) != 0 ||
+	    !mp_decode_uint_check(&data, &def->run_id) ||
+	    !mp_decode_u32_check(&data, &def->space_id) ||
+	    !mp_decode_u32_check(&data, &def->index_id) ||
+	    !mp_decode_uint_check(&data, &def->index_lsn) ||
+	    !mp_decode_u32_check(&data, &def->state) ||
+	    def->state >= vy_run_state_MAX)
+		goto fail;
+	if (mp_typeof(*data) != MP_ARRAY)
+		goto fail;
+	def->begin = data;
+	mp_next(&data);
+	if (mp_typeof(*data) != MP_ARRAY)
+		goto fail;
+	def->end = data;
+	return 0;
+fail:
+	diag_set(ClientError, ER_VINYL, "invalid metadata");
+	return -1;
+}
+
+/*
  * Insert a run record into the vinyl metadata table.
  *
  * This function allocates a unique ID for the run on success.
@@ -35,14 +101,11 @@ vy_meta_insert_run(const char *begin, const char *end,
 	if (box_index_max(BOX_VINYL_ID, 0, key, key_end, &max) != 0)
 		return -1;
 	if (max != NULL) {
-		const char *data = tuple_data(max);
-		(void)mp_decode_array(&data);
-		uint32_t len;
-		const char *str = mp_decode_str(&data, &len);
-		struct tt_uuid uuid;
-		if (tt_uuid_from_strl(str, len, &uuid) == 0 &&
-		    tt_uuid_is_equal(&uuid, &SERVER_UUID))
-			run_id = mp_decode_uint(&data) + 1;
+		struct vy_meta def;
+		if (vy_meta_create_from_tuple(&def, max) != 0)
+			return -1;
+		if (tt_uuid_is_equal(&def.server_uuid, &SERVER_UUID))
+			run_id = def.run_id + 1;
 	}
 
 	char empty_key[16];
