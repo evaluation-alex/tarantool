@@ -6372,7 +6372,7 @@ vy_begin_final_recovery(struct vy_env *e)
 }
 
 static int
-vy_index_end_recovery(struct vy_index *index)
+vy_index_end_local_recovery(struct vy_index *index)
 {
 	struct vy_range *range, *prev;
 
@@ -6390,41 +6390,6 @@ vy_index_end_recovery(struct vy_index *index)
 		if (prev != NULL &&
 		    vy_range_compare_end_with_begin(prev, range->begin) != 0)
 			goto run_missing;
-		if (index->env->is_remote_recovery) {
-			struct vy_mem *mem;
-			/*
-			 * Scheduler is turned off during recovery,
-			 * so no new mems/runs could appear.
-			 */
-			assert(range->mem_count == 1);
-			assert(range->run_count == 0);
-			/*
-			 * After we're done bootstrapping from a remote
-			 * server, but before the WAL thread is started,
-			 * we issue checkpoint (see bootstrap_from_master(),
-			 * box_init()). Checkpoint implies creating a new
-			 * mem and inserting a record for it to the meta
-			 * table (see vy_task_dump_new()). This record isn't
-			 * included in the snapshot, because technically it
-			 * is inserted after checkpoint is initiated. If the
-			 * WAL is unavailable (as in case of replication),
-			 * it won't be added to the WAL either and therefore
-			 * will be lost. To cope with this, we insert a new
-			 * mem along with a meta record to each range when
-			 * finalizing a new replica - this will make
-			 * vy_task_dump_new() skip mem creation.
-			 */
-			mem = vy_mem_new(index->key_def, index->format);
-			if (mem == NULL)
-				return -1;
-			rlist_add_entry(&range->mems, mem, link);
-			range->mem_count++;
-			if (vy_meta_insert_run(vy_range_begin_data(range),
-					       vy_range_end_data(range),
-					       index->key_def, VY_RUN_COMMITTED,
-					       &mem->id) != 0)
-				return -1;
-		}
 		if (range->mem_count == 0) {
 			/*
 			 * Each range must always have at least one
@@ -6448,12 +6413,57 @@ run_missing:
 	return -1;
 }
 
+static int
+vy_index_end_remote_recovery(struct vy_index *index)
+{
+	/*
+	 * Scheduler is turned off during recovery,
+	 * so no new mems/runs could appear.
+	 */
+	assert(index->range_count == 1);
+	struct vy_range *range = vy_range_tree_first(&index->tree);
+	assert(range->mem_count == 1);
+	assert(range->run_count == 0);
+	/*
+	 * After we're done bootstrapping from a remote server, but
+	 * before the WAL thread is started, we issue checkpoint (see
+	 * bootstrap_from_master(), box_init()). Checkpoint implies
+	 * creating a new mem and inserting a record for it to the
+	 * meta table (see vy_task_dump_new()). This record isn't
+	 * included in the snapshot, because technically it is
+	 * inserted after checkpoint is initiated. If the WAL is
+	 * unavailable (as in case of replication), it won't be added
+	 * to the WAL either and therefore will be lost. To cope with
+	 * this, we insert a new mem along with a meta record to each
+	 * range when finalizing a new replica - this will make
+	 * vy_task_dump_new() skip mem creation.
+	 *
+	 * TODO: create mem records on first insertion instead.
+	 */
+	struct vy_mem *mem = vy_mem_new(index->key_def, index->format);
+	if (mem == NULL)
+		return -1;
+	rlist_add_entry(&range->mems, mem, link);
+	range->mem_count++;
+	if (vy_meta_insert_run(vy_range_begin_data(range),
+			       vy_range_end_data(range),
+			       index->key_def, VY_RUN_COMMITTED,
+			       &mem->id) != 0)
+		return -1;
+	return 0;
+}
+
 int
 vy_end_recovery(struct vy_env *e)
 {
 	struct vy_index *index;
 	rlist_foreach_entry(index, &e->indexes, link) {
-		if (vy_index_end_recovery(index) != 0)
+		int rc;
+		if (e->is_remote_recovery)
+			rc = vy_index_end_remote_recovery(index);
+		else
+			rc = vy_index_end_local_recovery(index);
+		if (rc != 0)
 			return -1;
 	}
 	assert(e->status == VINYL_FINAL_RECOVERY);
