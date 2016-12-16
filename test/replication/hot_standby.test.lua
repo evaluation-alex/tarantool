@@ -1,5 +1,6 @@
 env = require('test_run')
 test_run = env.new()
+engine = test_run:get_cfg('engine')
 
 box.schema.user.grant('guest', 'replication')
 box.schema.func.create('_set_pri_lsn')
@@ -68,8 +69,9 @@ test_run:cmd("switch default")
 fiber = require('fiber')
 box.info.status
 
-space = box.schema.space.create('tweedledum')
-index = space:create_index('primary', { type = 'hash' })
+space = box.schema.space.create('tweedledum', {engine = engine})
+-- vinyl does not support hash index
+index = space:create_index('primary', {type = (engine == 'vinyl' and 'tree' or 'hash') })
 
 -- set begin lsn on master, replica and hot_standby.
 test_run:cmd("set variable replica_port to 'replica.listen'")
